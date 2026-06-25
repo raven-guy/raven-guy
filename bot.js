@@ -64,60 +64,56 @@ function validateConfig() {
 
 // ─── Browser ───────────────────────────────────────────────────────────────
 
-// Locations where Google Chrome is typically installed on macOS
 const MAC_CHROME_PATHS = [
   '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
   '/Applications/Chromium.app/Contents/MacOS/Chromium',
 ];
 
+// A persistent profile dir makes the browser look like a real returning user
+const PROFILE_DIR = path.join(__dirname, '.chrome-profile');
+
 async function launchBrowser() {
-  const opts = {
-    headless: cfg.headless,
-    args: [
-      '--disable-blink-features=AutomationControlled',
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-infobars',
-      '--disable-dev-shm-usage',
-    ],
-  };
-
-  // Prefer the user's real Chrome — it has a genuine fingerprint that passes bot detection
   const realChrome = MAC_CHROME_PATHS.find(p => fs.existsSync(p));
-  if (realChrome) {
-    opts.executablePath = realChrome;
-    console.log(`Using real Chrome: ${realChrome}`);
-  } else if (fs.existsSync('/opt/pw-browsers/chromium')) {
-    opts.executablePath = '/opt/pw-browsers/chromium';
-  } else {
-    // Let Playwright find the browser via channel
-    opts.channel = 'chrome';
-  }
 
-  return chromium.launch(opts);
-}
+  const executablePath = realChrome
+    || (fs.existsSync('/opt/pw-browsers/chromium') ? '/opt/pw-browsers/chromium' : undefined);
 
-async function buildContext(browser) {
-  const context = await browser.newContext({
-    viewport: { width: 1280, height: 800 },
-    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    locale: 'en-US',
-    timezoneId: 'Europe/Amsterdam',
+  if (executablePath) console.log(`Using Chrome: ${executablePath}`);
+
+  const args = [
+    '--disable-blink-features=AutomationControlled',
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-infobars',
+    '--disable-dev-shm-usage',
+    '--no-first-run',
+    '--no-default-browser-check',
+  ];
+
+  // launchPersistentContext keeps cookies, localStorage and fingerprint
+  // data between runs — exactly like a real user's browser.
+  const context = await chromium.launchPersistentContext(PROFILE_DIR, {
+    headless:     cfg.headless,
+    executablePath,
+    args,
+    viewport:     { width: 1366, height: 768 },
+    userAgent:    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    locale:       'en-US',
+    timezoneId:   'Europe/Amsterdam',
   });
-
-  if (fs.existsSync(cfg.sessionFile)) {
-    try {
-      const cookies = JSON.parse(fs.readFileSync(cfg.sessionFile, 'utf8'));
-      await context.addCookies(cookies);
-      console.log(`[${ts()}] Restored saved session.`);
-    } catch { /* ignore corrupt file */ }
-  }
 
   await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    window.chrome = { runtime: {} };
   });
 
   return context;
+}
+
+// With persistent context there is no separate browser object to close —
+// closing the context closes everything.
+async function buildContext() {
+  throw new Error('buildContext should not be called with persistent context');
 }
 
 // ─── Login ─────────────────────────────────────────────────────────────────
@@ -412,12 +408,12 @@ async function main() {
   events.forEach(e => console.log(`  • [${e.label}] ${e.url}  (max €${e.maxPrice}, qty ${e.quantity})`));
   console.log();
 
-  const browser = await launchBrowser();
-  const context = await buildContext(browser);
+  // launchBrowser() returns the persistent context directly
+  const context = await launchBrowser();
 
   process.on('SIGINT', async () => {
     console.log('\nShutting down...');
-    await browser.close();
+    await context.close();
     process.exit(0);
   });
 
@@ -439,7 +435,7 @@ async function main() {
     console.error(`[${ts()}] ✗  ${e.message}`);
     if (cfg.headless) console.warn(`[${ts()}] ⚠  Tip: run with HEADLESS=false to debug.`);
   } finally {
-    await browser.close();
+    await context.close();
   }
 }
 
