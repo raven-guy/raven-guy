@@ -407,6 +407,10 @@ async function pollEvent(context, event) {
         process.stdout.write(`\r  [${event.label}] attempt ${attempt} — no eligible tickets yet...   `);
       }
     } catch (e) {
+      if (e.message.includes('closed')) {
+        warn(event.label, 'Browser was closed — stopping bot. Run npm start again.');
+        process.exit(1);
+      }
       warn(event.label, `Poll error: ${e.message}`);
     }
 
