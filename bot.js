@@ -117,34 +117,38 @@ async function isLoggedIn(page) {
 }
 
 async function login(page) {
-  console.log(`[${ts()}] Logging in...`);
+  console.log(`[${ts()}] Opening browser for login — check your email for the code.`);
   await page.goto('https://www.ticketswap.com/login', { waitUntil: 'domcontentloaded', timeout: 20000 });
   await acceptCookies(page);
 
+  // Enter email and submit — TicketSwap sends a magic link / OTP to the inbox
   await page.waitForSelector('input[type="email"], input[name="email"]', { timeout: 10000 });
   await page.fill('input[type="email"], input[name="email"]', cfg.email);
-  await page.fill('input[type="password"], input[name="password"]', cfg.password);
 
   await Promise.all([
-    page.waitForNavigation({ timeout: 20000, waitUntil: 'domcontentloaded' }),
+    page.waitForNavigation({ timeout: 20000, waitUntil: 'domcontentloaded' }).catch(() => {}),
     page.click('button[type="submit"]'),
   ]);
 
-  const url = page.url();
-  if (url.includes('verify') || url.includes('2fa') || url.includes('captcha')) {
-    console.warn(`[${ts()}] ⚠  2FA/CAPTCHA detected — please complete it in the browser.`);
-    await page.waitForURL(
-      u => !u.includes('verify') && !u.includes('2fa') && !u.includes('captcha'),
-      { timeout: 120000 }
-    );
-  }
+  // TicketSwap will show an OTP / code input or send a magic link.
+  // Either way the user must complete it manually in the browser window.
+  console.log(`\n[${ts()}] ⚠  Check your email (${cfg.email}) for a login code or link.`);
+  console.log(`[${ts()}] ⚠  Enter it in the browser window. Waiting up to 5 minutes...\n`);
 
+  // Wait until we land on a non-auth page (i.e. login is complete)
+  await page.waitForURL(
+    url => !url.includes('/login') && !url.includes('/auth') && !url.includes('/verify'),
+    { timeout: 300000 }
+  ).catch(() => {});
+
+  // Final check
   const loggedIn = await page.$('[data-testid="user-menu"], a[href*="/logout"], [aria-label*="account"], [aria-label*="Account"]').catch(() => null);
-  if (!loggedIn) throw new Error('Login failed — check credentials or complete 2FA/CAPTCHA.');
+  if (!loggedIn) throw new Error('Login timed out or failed. Run with HEADLESS=false and complete the login manually.');
 
+  // Save session so we don't need to log in again next time
   const cookies = await page.context().cookies();
   fs.writeFileSync(cfg.sessionFile, JSON.stringify(cookies, null, 2));
-  console.log(`[${ts()}] ✓  Logged in.`);
+  console.log(`[${ts()}] ✓  Logged in. Session saved — next run will skip login.`);
 }
 
 // ─── Cookie consent ────────────────────────────────────────────────────────
