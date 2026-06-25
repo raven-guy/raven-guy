@@ -354,6 +354,22 @@ async function clickConfirmButton(page, label) {
   return false;
 }
 
+// ─── Verification challenge handler ────────────────────────────────────────
+
+async function waitForVerification(page, label) {
+  const body = await page.evaluate(() => document.body.innerText).catch(() => '');
+  if (!body.includes('Unable to verify')) return; // no challenge, all good
+
+  console.log(`\n[${ts()}] [${label}] ⚠  Bot check detected!`);
+  console.log(`[${ts()}] [${label}] ⚠  Click the "Retry" button in the browser tab for [${label}].`);
+  console.log(`[${ts()}] [${label}] ⚠  Waiting up to 2 minutes for you to solve it...\n`);
+
+  await page.waitForFunction(
+    () => !document.body.innerText.includes('Unable to verify'),
+    { timeout: 120000, polling: 1000 }
+  ).catch(() => {});
+}
+
 // ─── Per-event poller ──────────────────────────────────────────────────────
 
 async function pollEvent(context, event) {
@@ -374,6 +390,9 @@ async function pollEvent(context, event) {
     try {
       await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
       await acceptCookies(page);
+
+      // If Cloudflare/TicketSwap shows a challenge, wait for the user to solve it
+      await waitForVerification(page, event.label);
 
       const ticket = await findEligibleTicket(page, event);
 
