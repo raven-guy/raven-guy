@@ -1,0 +1,14 @@
+{
+  "name": "ticketswap-auto-buyer",
+  "version": "1.0.0",
+  "description": "Automatically buy tickets on TicketSwap the moment they become available",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "start:headed": "HEADLESS=false node bot.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "playwright": "^1.56.0"
+  }
+}
