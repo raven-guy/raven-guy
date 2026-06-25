@@ -12,27 +12,54 @@ const path = require('path');
 const cfg = {
   email:        process.env.TS_EMAIL,
   password:     process.env.TS_PASSWORD,
-  eventUrl:     process.env.TS_EVENT_URL,
-  maxPrice:     parseFloat(process.env.TS_MAX_PRICE)    || Infinity,
-  quantity:     parseInt(process.env.TS_QUANTITY, 10)   || 1,
   pollInterval: parseInt(process.env.TS_POLL_INTERVAL, 10) || 2000,
   headless:     process.env.HEADLESS !== 'false',
   sessionFile:  path.join(__dirname, '.session.json'),
+  eventsFile:   path.join(__dirname, 'events.json'),
 };
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
-function log(msg)  { console.log(`[${timestamp()}] ${msg}`); }
-function warn(msg) { console.warn(`[${timestamp()}] ⚠  ${msg}`); }
-function ok(msg)   { console.log(`[${timestamp()}] ✓  ${msg}`); }
-function err(msg)  { console.error(`[${timestamp()}] ✗  ${msg}`); }
-function timestamp() { return new Date().toLocaleTimeString(); }
+function log(label, msg)  { console.log(`[${ts()}] [${label}] ${msg}`); }
+function warn(label, msg) { console.warn(`[${ts()}] [${label}] ⚠  ${msg}`); }
+function ok(label, msg)   { console.log(`[${ts()}] [${label}] ✓  ${msg}`); }
+function err(label, msg)  { console.error(`[${ts()}] [${label}] ✗  ${msg}`); }
+function ts() { return new Date().toLocaleTimeString(); }
+
+function loadEvents() {
+  // Prefer events.json for multi-event support
+  if (fs.existsSync(cfg.eventsFile)) {
+    const events = JSON.parse(fs.readFileSync(cfg.eventsFile, 'utf8'));
+    if (!Array.isArray(events) || events.length === 0) {
+      console.error('events.json must be a non-empty array. See events.example.json.');
+      process.exit(1);
+    }
+    return events.map((e, i) => ({
+      label:    e.label    || `Event ${i + 1}`,
+      url:      e.url,
+      maxPrice: e.maxPrice != null ? parseFloat(e.maxPrice) : Infinity,
+      quantity: e.quantity != null ? parseInt(e.quantity, 10) : 1,
+    }));
+  }
+
+  // Fallback: single event from env vars
+  if (!process.env.TS_EVENT_URL) {
+    console.error('No events configured. Either create events.json or set TS_EVENT_URL in .env');
+    process.exit(1);
+  }
+  return [{
+    label:    'Event 1',
+    url:      process.env.TS_EVENT_URL,
+    maxPrice: parseFloat(process.env.TS_MAX_PRICE) || Infinity,
+    quantity: parseInt(process.env.TS_QUANTITY, 10) || 1,
+  }];
+}
 
 function validateConfig() {
-  const missing = ['email', 'password', 'eventUrl'].filter(k => !cfg[k]);
+  const missing = ['email', 'password'].filter(k => !cfg[k]);
   if (missing.length) {
-    err(`Missing required env vars: ${missing.map(k => `TS_${k.toUpperCase()}`).join(', ')}`);
-    err('Copy .env.example to .env and fill in your details.');
+    console.error(`Missing required env vars: ${missing.map(k => `TS_${k.toUpperCase()}`).join(', ')}`);
+    console.error('Copy .env.example to .env and fill in your details.');
     process.exit(1);
   }
 }
@@ -40,7 +67,7 @@ function validateConfig() {
 // ─── Browser ───────────────────────────────────────────────────────────────
 
 async function launchBrowser() {
-  const launchOpts = {
+  const opts = {
     headless: cfg.headless,
     args: [
       '--disable-blink-features=AutomationControlled',
@@ -48,39 +75,28 @@ async function launchBrowser() {
       '--disable-setuid-sandbox',
     ],
   };
-
-  // Use the pre-installed Chromium when available
   if (fs.existsSync('/opt/pw-browsers/chromium')) {
-    launchOpts.executablePath = '/opt/pw-browsers/chromium';
+    opts.executablePath = '/opt/pw-browsers/chromium';
   }
-
-  return chromium.launch(launchOpts);
+  return chromium.launch(opts);
 }
 
 async function buildContext(browser) {
   const context = await browser.newContext({
     viewport: { width: 1280, height: 800 },
-    userAgent: [
-      'Mozilla/5.0 (X11; Linux x86_64)',
-      'AppleWebKit/537.36 (KHTML, like Gecko)',
-      'Chrome/124.0.0.0 Safari/537.36',
-    ].join(' '),
+    userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     locale: 'en-US',
     timezoneId: 'Europe/Amsterdam',
   });
 
-  // Restore saved session cookies if present
   if (fs.existsSync(cfg.sessionFile)) {
     try {
       const cookies = JSON.parse(fs.readFileSync(cfg.sessionFile, 'utf8'));
       await context.addCookies(cookies);
-      log('Restored saved session.');
-    } catch {
-      // Ignore corrupt session file
-    }
+      console.log(`[${ts()}] Restored saved session.`);
+    } catch { /* ignore corrupt file */ }
   }
 
-  // Remove navigator.webdriver flag so TicketSwap doesn't flag us easily
   await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   });
@@ -93,7 +109,6 @@ async function buildContext(browser) {
 async function isLoggedIn(page) {
   try {
     await page.goto('https://www.ticketswap.com', { waitUntil: 'domcontentloaded', timeout: 15000 });
-    // Logged-in state: no "Log in" button visible, or user avatar/name is present
     const loginBtn = await page.$('a[href*="/login"], button:has-text("Log in"), a:has-text("Log in")');
     return loginBtn === null;
   } catch {
@@ -102,55 +117,34 @@ async function isLoggedIn(page) {
 }
 
 async function login(page) {
-  log('Navigating to login page...');
+  console.log(`[${ts()}] Logging in...`);
   await page.goto('https://www.ticketswap.com/login', { waitUntil: 'domcontentloaded', timeout: 20000 });
-
-  // Accept cookies if the banner appears
   await acceptCookies(page);
 
-  // Fill email
   await page.waitForSelector('input[type="email"], input[name="email"]', { timeout: 10000 });
   await page.fill('input[type="email"], input[name="email"]', cfg.email);
-
-  // Fill password
   await page.fill('input[type="password"], input[name="password"]', cfg.password);
 
-  // Submit
   await Promise.all([
     page.waitForNavigation({ timeout: 20000, waitUntil: 'domcontentloaded' }),
     page.click('button[type="submit"]'),
   ]);
 
-  // Check for 2FA or CAPTCHA
   const url = page.url();
   if (url.includes('verify') || url.includes('2fa') || url.includes('captcha')) {
-    warn('2FA / CAPTCHA detected. Please complete it in the browser window.');
-    warn('The bot will continue automatically once you are logged in.');
-    await page.waitForURL(u => !u.includes('verify') && !u.includes('2fa') && !u.includes('captcha'), {
-      timeout: 120000,
-    });
+    console.warn(`[${ts()}] ⚠  2FA/CAPTCHA detected — please complete it in the browser.`);
+    await page.waitForURL(
+      u => !u.includes('verify') && !u.includes('2fa') && !u.includes('captcha'),
+      { timeout: 120000 }
+    );
   }
 
-  if (!(await isOnLoggedInPage(page))) {
-    throw new Error('Login failed — check your credentials or solve any CAPTCHA/2FA in headed mode.');
-  }
+  const loggedIn = await page.$('[data-testid="user-menu"], a[href*="/logout"], [aria-label*="account"], [aria-label*="Account"]').catch(() => null);
+  if (!loggedIn) throw new Error('Login failed — check credentials or complete 2FA/CAPTCHA.');
 
-  // Persist cookies for future runs
   const cookies = await page.context().cookies();
   fs.writeFileSync(cfg.sessionFile, JSON.stringify(cookies, null, 2));
-  ok('Logged in and session saved.');
-}
-
-async function isOnLoggedInPage(page) {
-  try {
-    await page.waitForSelector(
-      'a[href*="/logout"], [data-testid="user-menu"], [aria-label*="account"], [aria-label*="Account"]',
-      { timeout: 5000 }
-    );
-    return true;
-  } catch {
-    return false;
-  }
+  console.log(`[${ts()}] ✓  Logged in.`);
 }
 
 // ─── Cookie consent ────────────────────────────────────────────────────────
@@ -162,18 +156,11 @@ async function acceptCookies(page) {
       { timeout: 4000 }
     );
     if (btn) await btn.click();
-  } catch {
-    // No cookie banner — fine
-  }
+  } catch { /* no banner */ }
 }
 
 // ─── Ticket detection ──────────────────────────────────────────────────────
 
-/**
- * Selectors tried in order — TicketSwap uses dynamic class names that change,
- * so we use multiple strategies: data-testid attributes, semantic text, and
- * structural patterns.
- */
 const TICKET_SELECTORS = [
   '[data-testid*="listing"]',
   '[data-testid*="ticket"]',
@@ -188,7 +175,7 @@ const TICKET_SELECTORS = [
 const BUY_BTN_SELECTORS = [
   'button:has-text("Buy")',
   'a:has-text("Buy")',
-  'button:has-text("Koop")',    // Dutch
+  'button:has-text("Koop")',
   'a:has-text("Koop")',
   '[data-testid*="buy"]',
   'button[class*="buy"]',
@@ -206,7 +193,6 @@ const PRICE_SELECTORS = [
 ];
 
 async function scrapeListings(page) {
-  // Try each container selector in turn
   for (const sel of TICKET_SELECTORS) {
     const items = await page.$$(sel);
     if (items.length > 0) return items;
@@ -220,21 +206,15 @@ async function extractPrice(element) {
       const text = await element.$eval(sel, el => el.textContent);
       const match = text.match(/[\d]+[.,]?\d*/);
       if (match) return parseFloat(match[0].replace(',', '.'));
-    } catch {
-      // Try next selector
-    }
+    } catch { /* try next */ }
   }
-  // Last resort: grab all text and find a number that looks like a price
   try {
     const text = await element.evaluate(el => el.innerText);
-    const match = text.match(/€\s*([\d]+[.,]?\d*)/);
-    if (match) return parseFloat(match[1].replace(',', '.'));
-    // Any number in the element
-    const any = text.match(/([\d]+[.,]\d{2})/);
-    if (any) return parseFloat(any[1].replace(',', '.'));
-  } catch {
-    // ignored
-  }
+    const m1 = text.match(/€\s*([\d]+[.,]?\d*)/);
+    if (m1) return parseFloat(m1[1].replace(',', '.'));
+    const m2 = text.match(/([\d]+[.,]\d{2})/);
+    if (m2) return parseFloat(m2[1].replace(',', '.'));
+  } catch { /* ignored */ }
   return null;
 }
 
@@ -243,37 +223,26 @@ async function findBuyButton(element) {
     try {
       const btn = await element.$(sel);
       if (btn) return btn;
-    } catch {
-      // Try next
-    }
+    } catch { /* try next */ }
   }
-  // Also check the element itself
   try {
-    const tag = await element.evaluate(el => el.tagName.toLowerCase());
-    if (tag === 'a' || tag === 'button') {
-      const text = await element.evaluate(el => el.innerText.toLowerCase());
-      if (text.includes('buy') || text.includes('koop')) return element;
+    const tag  = await element.evaluate(el => el.tagName.toLowerCase());
+    const text = await element.evaluate(el => el.innerText.toLowerCase());
+    if ((tag === 'a' || tag === 'button') && (text.includes('buy') || text.includes('koop'))) {
+      return element;
     }
-  } catch {
-    // ignored
-  }
+  } catch { /* ignored */ }
   return null;
 }
 
-async function findEligibleTicket(page) {
+async function findEligibleTicket(page, event) {
   const listings = await scrapeListings(page);
   if (listings.length === 0) return null;
-
-  log(`Found ${listings.length} listing(s) — checking prices...`);
 
   for (const listing of listings) {
     const price = await extractPrice(listing);
     if (price === null) continue;
-
-    if (price > cfg.maxPrice) {
-      log(`  €${price.toFixed(2)} — too expensive (max €${cfg.maxPrice}), skipping.`);
-      continue;
-    }
+    if (price > event.maxPrice) continue;
 
     const btn = await findBuyButton(listing);
     if (!btn) continue;
@@ -283,147 +252,120 @@ async function findEligibleTicket(page) {
 
     return { listing, btn, price };
   }
-
   return null;
 }
 
 // ─── Purchase flow ─────────────────────────────────────────────────────────
 
-async function buyTicket(page, { listing, btn, price }) {
-  ok(`Ticket found at €${price.toFixed(2)}! Starting purchase...`);
-
-  // Click the buy button on the listing
+async function buyTicket(page, event, { btn, price }) {
+  ok(event.label, `Ticket at €${price.toFixed(2)}! Buying...`);
   await btn.click();
 
-  // TicketSwap opens a modal or navigates to a checkout page
   await Promise.race([
     page.waitForURL(u => u.includes('checkout') || u.includes('purchase') || u.includes('order'), { timeout: 10000 }),
     page.waitForSelector('[data-testid*="checkout"], [class*="checkout"], [class*="Checkout"]', { timeout: 10000 }),
-    page.waitForTimeout(5000), // fallback — continue regardless
+    page.waitForTimeout(5000),
   ]).catch(() => {});
 
-  log(`Current URL: ${page.url()}`);
-
-  // Handle quantity selection if a number input appears
-  await selectQuantity(page);
-
-  // Accept terms if a checkbox is shown
+  await selectQuantity(page, event);
   await acceptTerms(page);
 
-  // Click the final confirm / pay button
-  const confirmed = await clickConfirmButton(page);
+  const confirmed = await clickConfirmButton(page, event.label);
   if (!confirmed) {
-    warn('Could not find confirm/pay button — manual action may be required.');
+    warn(event.label, 'Could not find confirm/pay button — manual action may be required.');
     return false;
   }
 
-  // Wait a moment and check if we landed on a success page
   await page.waitForTimeout(4000);
   const finalUrl = page.url();
-  const success = /success|confirm|order|thank/i.test(finalUrl);
+  const success  = /success|confirm|order|thank/i.test(finalUrl);
 
-  if (success) {
-    ok(`Purchase complete! Order page: ${finalUrl}`);
-  } else {
-    warn(`Purchase outcome unclear. Final URL: ${finalUrl}`);
-    warn('Check your TicketSwap account for order confirmation.');
-  }
+  if (success) ok(event.label, `Purchase complete! ${finalUrl}`);
+  else warn(event.label, `Outcome unclear — check your TicketSwap account. URL: ${finalUrl}`);
 
   return success;
 }
 
-async function selectQuantity(page) {
-  if (cfg.quantity === 1) return;
-
+async function selectQuantity(page, event) {
+  if (event.quantity === 1) return;
   try {
-    // Some flows show a quantity stepper
     const plus = await page.$('[data-testid*="increase"], button[aria-label*="increase"], button:has-text("+")');
     if (plus) {
-      for (let i = 1; i < cfg.quantity; i++) {
+      for (let i = 1; i < event.quantity; i++) {
         await plus.click();
         await page.waitForTimeout(300);
       }
       return;
     }
-
-    // Or a plain number input
     const input = await page.$('input[type="number"]');
-    if (input) {
-      await input.fill(String(cfg.quantity));
-    }
+    if (input) await input.fill(String(event.quantity));
   } catch {
-    warn('Could not set quantity — proceeding with default.');
+    warn(event.label, 'Could not set quantity — proceeding with default.');
   }
 }
 
 async function acceptTerms(page) {
   try {
     const checkbox = await page.$('input[type="checkbox"]');
-    if (checkbox) {
-      const checked = await checkbox.isChecked();
-      if (!checked) await checkbox.click();
-    }
-  } catch {
-    // No checkbox — fine
-  }
+    if (checkbox && !(await checkbox.isChecked())) await checkbox.click();
+  } catch { /* no checkbox */ }
 }
 
-async function clickConfirmButton(page) {
+async function clickConfirmButton(page, label) {
   const candidates = [
-    'button:has-text("Confirm")',
-    'button:has-text("Pay")',
-    'button:has-text("Buy now")',
-    'button:has-text("Place order")',
-    'button:has-text("Complete")',
-    'button:has-text("Bevestig")',
-    'button:has-text("Betaal")',
-    '[data-testid*="confirm"]',
-    '[data-testid*="pay"]',
-    'button[type="submit"]',
+    'button:has-text("Confirm")', 'button:has-text("Pay")',
+    'button:has-text("Buy now")', 'button:has-text("Place order")',
+    'button:has-text("Complete")', 'button:has-text("Bevestig")',
+    'button:has-text("Betaal")', '[data-testid*="confirm"]',
+    '[data-testid*="pay"]', 'button[type="submit"]',
   ];
-
   for (const sel of candidates) {
     try {
       const btn = await page.$(sel);
       if (!btn) continue;
-      const disabled = await btn.evaluate(el => el.disabled);
-      if (disabled) continue;
+      if (await btn.evaluate(el => el.disabled)) continue;
       await btn.click();
-      log(`Clicked confirm button (${sel})`);
       return true;
-    } catch {
-      // Try next
-    }
+    } catch { /* try next */ }
   }
   return false;
 }
 
-// ─── Poller ────────────────────────────────────────────────────────────────
+// ─── Per-event poller ──────────────────────────────────────────────────────
 
-async function pollForTickets(page) {
+async function pollEvent(context, event) {
+  const page = await context.newPage();
+
+  // Block heavy assets on this page to speed up reloads
+  await page.route('**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf,otf}', r => r.abort());
+
+  log(event.label, `Starting — ${event.url}`);
+  log(event.label, `Max price: €${event.maxPrice}  |  Qty: ${event.quantity}`);
+
+  await page.goto(event.url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+
   let attempt = 0;
-
-  log(`Polling ${cfg.eventUrl} every ${cfg.pollInterval}ms (max price: €${cfg.maxPrice}, qty: ${cfg.quantity})`);
-  log('Press Ctrl+C to stop.\n');
 
   while (true) {
     attempt++;
-
     try {
       await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
       await acceptCookies(page);
 
-      const ticket = await findEligibleTicket(page);
+      const ticket = await findEligibleTicket(page, event);
 
       if (ticket) {
-        const bought = await buyTicket(page, ticket);
-        if (bought) return true;
-        warn('Purchase attempt failed — will retry on next poll.');
+        const bought = await buyTicket(page, event, ticket);
+        if (bought) {
+          await page.close();
+          return { event, success: true };
+        }
+        warn(event.label, 'Purchase failed — retrying next poll.');
       } else {
-        process.stdout.write(`\r  [attempt ${attempt}] No eligible tickets yet. Retrying in ${cfg.pollInterval}ms...   `);
+        process.stdout.write(`\r  [${event.label}] attempt ${attempt} — no eligible tickets yet...   `);
       }
     } catch (e) {
-      warn(`Poll error (attempt ${attempt}): ${e.message}`);
+      warn(event.label, `Poll error: ${e.message}`);
     }
 
     await sleep(cfg.pollInterval);
@@ -432,23 +374,21 @@ async function pollForTickets(page) {
 
 // ─── Main ──────────────────────────────────────────────────────────────────
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function main() {
   validateConfig();
+  const events = loadEvents();
 
   console.log('\n╔══════════════════════════════════╗');
   console.log('║   TicketSwap Auto-Buyer Bot      ║');
-  console.log('╚══════════════════════════════════╝\n');
+  console.log('╚══════════════════════════════════╝');
+  console.log(`\n  Watching ${events.length} event(s). Press Ctrl+C to stop.\n`);
+  events.forEach(e => console.log(`  • [${e.label}] ${e.url}  (max €${e.maxPrice}, qty ${e.quantity})`));
+  console.log();
 
   const browser = await launchBrowser();
   const context = await buildContext(browser);
-  const page    = await context.newPage();
-
-  // Intercept and block heavy assets to speed up page loads
-  await page.route('**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf,otf}', route => route.abort());
 
   process.on('SIGINT', async () => {
     console.log('\nShutting down...');
@@ -457,27 +397,22 @@ async function main() {
   });
 
   try {
-    // Check if saved session is still valid
-    const alreadyIn = await isLoggedIn(page);
-
+    // Login once using a temporary page
+    const loginPage = await context.newPage();
+    const alreadyIn = await isLoggedIn(loginPage);
     if (alreadyIn) {
-      ok('Session still active — skipping login.');
+      console.log(`[${ts()}] ✓  Session still active — skipping login.`);
     } else {
-      await login(page);
+      await login(loginPage);
     }
+    await loginPage.close();
 
-    // Navigate to the target event
-    log(`Navigating to event: ${cfg.eventUrl}`);
-    await page.goto(cfg.eventUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-
-    // Start polling
-    await pollForTickets(page);
+    // Poll all events concurrently — each gets its own tab
+    await Promise.all(events.map(event => pollEvent(context, event)));
 
   } catch (e) {
-    err(e.message);
-    if (cfg.headless) {
-      warn('Tip: run with HEADLESS=false to see what the browser is doing.');
-    }
+    console.error(`[${ts()}] ✗  ${e.message}`);
+    if (cfg.headless) console.warn(`[${ts()}] ⚠  Tip: run with HEADLESS=false to debug.`);
   } finally {
     await browser.close();
   }

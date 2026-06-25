@@ -1,0 +1,20 @@
+[
+  {
+    "label": "Festival A",
+    "url": "https://www.ticketswap.com/event/festival-a/12345",
+    "maxPrice": 80,
+    "quantity": 2
+  },
+  {
+    "label": "Concert B",
+    "url": "https://www.ticketswap.com/event/concert-b/67890",
+    "maxPrice": 50,
+    "quantity": 1
+  },
+  {
+    "label": "Rave C",
+    "url": "https://www.ticketswap.com/event/rave-c/11111",
+    "maxPrice": 30,
+    "quantity": 1
+  }
+]
