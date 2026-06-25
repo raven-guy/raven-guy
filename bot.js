@@ -3,38 +3,38 @@
 'use strict';
 
 require('dotenv').config();
-const { chromium } = require('playwright-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-chromium.use(StealthPlugin());
-const fs = require('fs');
+const fs   = require('fs');
 const path = require('path');
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
 const cfg = {
-  email:        process.env.TS_EMAIL,
-  pollInterval: parseInt(process.env.TS_POLL_INTERVAL, 10) || 2000,
-  headless:     process.env.HEADLESS !== 'false',
-  sessionFile:  path.join(__dirname, '.session.json'),
+  token:        process.env.TS_TOKEN,
+  pollInterval: parseInt(process.env.TS_POLL_INTERVAL, 10) || 3000,
   eventsFile:   path.join(__dirname, 'events.json'),
 };
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
-function log(label, msg)  { console.log(`[${ts()}] [${label}] ${msg}`); }
-function warn(label, msg) { console.warn(`[${ts()}] [${label}] ⚠  ${msg}`); }
-function ok(label, msg)   { console.log(`[${ts()}] [${label}] ✓  ${msg}`); }
-function err(label, msg)  { console.error(`[${ts()}] [${label}] ✗  ${msg}`); }
-function ts() { return new Date().toLocaleTimeString(); }
+function ts()             { return new Date().toLocaleTimeString(); }
+function log(lbl, msg)    { console.log(`[${ts()}] [${lbl}] ${msg}`); }
+function warn(lbl, msg)   { console.warn(`[${ts()}] [${lbl}] ⚠  ${msg}`); }
+function ok(lbl, msg)     { console.log(`[${ts()}] [${lbl}] ✓  ${msg}`); }
+function sleep(ms)        { return new Promise(r => setTimeout(r, ms)); }
+
+// ─── Validate ──────────────────────────────────────────────────────────────
+
+function validateConfig() {
+  if (!cfg.token) {
+    console.error('Missing TS_TOKEN in your .env file.');
+    console.error('Open ticketswap.com in Chrome → DevTools → Application → Cookies → copy the "token" value.');
+    process.exit(1);
+  }
+}
 
 function loadEvents() {
-  // Prefer events.json for multi-event support
   if (fs.existsSync(cfg.eventsFile)) {
     const events = JSON.parse(fs.readFileSync(cfg.eventsFile, 'utf8'));
-    if (!Array.isArray(events) || events.length === 0) {
-      console.error('events.json must be a non-empty array. See events.example.json.');
-      process.exit(1);
-    }
     return events.map((e, i) => ({
       label:    e.label    || `Event ${i + 1}`,
       url:      e.url,
@@ -42,10 +42,8 @@ function loadEvents() {
       quantity: e.quantity != null ? parseInt(e.quantity, 10) : 1,
     }));
   }
-
-  // Fallback: single event from env vars
   if (!process.env.TS_EVENT_URL) {
-    console.error('No events configured. Either create events.json or set TS_EVENT_URL in .env');
+    console.error('No events configured. Create events.json or set TS_EVENT_URL in .env');
     process.exit(1);
   }
   return [{
@@ -56,362 +54,210 @@ function loadEvents() {
   }];
 }
 
-function validateConfig() {
-  if (!cfg.email) {
-    console.error('Missing required env var: TS_EMAIL');
-    console.error('Run: echo "TS_EMAIL=your@email.com" > .env');
-    process.exit(1);
-  }
+// ─── HTTP helpers ──────────────────────────────────────────────────────────
+
+const BASE_HEADERS = {
+  'User-Agent':      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+};
+
+function authHeaders(extra = {}) {
+  return {
+    ...BASE_HEADERS,
+    'Cookie':        `token=${cfg.token}`,
+    'Authorization': `Bearer ${cfg.token}`,
+    ...extra,
+  };
 }
 
-// ─── Browser ───────────────────────────────────────────────────────────────
+async function fetchPage(url) {
+  const res = await fetch(url, { headers: authHeaders() });
+  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+  return res.text();
+}
 
-const MAC_CHROME_PATHS = [
-  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-  '/Applications/Chromium.app/Contents/MacOS/Chromium',
-];
-
-// A persistent profile dir makes the browser look like a real returning user
-const PROFILE_DIR = path.join(__dirname, '.chrome-profile');
-
-async function launchBrowser() {
-  const realChrome = MAC_CHROME_PATHS.find(p => fs.existsSync(p));
-
-  const executablePath = realChrome
-    || (fs.existsSync('/opt/pw-browsers/chromium') ? '/opt/pw-browsers/chromium' : undefined);
-
-  if (executablePath) console.log(`Using Chrome: ${executablePath}`);
-
-  const args = [
-    '--disable-blink-features=AutomationControlled',
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-infobars',
-    '--disable-dev-shm-usage',
-    '--no-first-run',
-    '--no-default-browser-check',
-  ];
-
-  // launchPersistentContext keeps cookies, localStorage and fingerprint
-  // data between runs — exactly like a real user's browser.
-  const context = await chromium.launchPersistentContext(PROFILE_DIR, {
-    headless:     cfg.headless,
-    executablePath,
-    args,
-    viewport:     { width: 1366, height: 768 },
-    userAgent:    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    locale:       'en-US',
-    timezoneId:   'Europe/Amsterdam',
+async function graphql(query, variables = {}) {
+  const res = await fetch('https://api.ticketswap.com/graphql/public', {
+    method:  'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json', 'Accept': 'application/json' }),
+    body:    JSON.stringify({ query, variables }),
   });
-
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    window.chrome = { runtime: {} };
-  });
-
-  return context;
+  if (!res.ok) throw new Error(`GraphQL HTTP ${res.status}`);
+  return res.json();
 }
 
-// With persistent context there is no separate browser object to close —
-// closing the context closes everything.
-async function buildContext() {
-  throw new Error('buildContext should not be called with persistent context');
+// ─── Parse tickets from page HTML ──────────────────────────────────────────
+
+function parseNextData(html) {
+  const m = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
+  if (!m) return null;
+  try { return JSON.parse(m[1]); } catch { return null; }
 }
 
-// ─── Login ─────────────────────────────────────────────────────────────────
+function extractListingsFromNextData(data) {
+  if (!data) return [];
+  const listings = [];
 
-async function isLoggedIn(page) {
-  try {
-    await page.goto('https://www.ticketswap.com', { waitUntil: 'domcontentloaded', timeout: 15000 });
-
-    // If TicketSwap shows a bot-detection page, we are definitely not logged in
-    const bodyText = await page.evaluate(() => document.body.innerText).catch(() => '');
-    if (bodyText.includes('Unable to verify') || bodyText.includes('Retry')) return false;
-
-    const loginBtn = await page.$('a[href*="/login"], button:has-text("Log in"), a:has-text("Log in")');
-    return loginBtn === null;
-  } catch {
-    return false;
-  }
-}
-
-async function login(page) {
-  console.log(`[${ts()}] Opening browser for login — check your email for the code.`);
-  await page.goto('https://www.ticketswap.com/login', { waitUntil: 'domcontentloaded', timeout: 20000 });
-  await acceptCookies(page);
-
-  // Enter email and submit — TicketSwap sends a magic link / OTP to the inbox
-  await page.waitForSelector('input[type="email"], input[name="email"]', { timeout: 10000 });
-  await page.fill('input[type="email"], input[name="email"]', cfg.email);
-
-  await Promise.all([
-    page.waitForNavigation({ timeout: 20000, waitUntil: 'domcontentloaded' }).catch(() => {}),
-    page.click('button[type="submit"]'),
-  ]);
-
-  // TicketSwap will show an OTP / code input or send a magic link.
-  // Either way the user must complete it manually in the browser window.
-  console.log(`\n[${ts()}] ⚠  Check your email (${cfg.email}) for a login code or link.`);
-  console.log(`[${ts()}] ⚠  Enter it in the browser window. Waiting up to 5 minutes...\n`);
-
-  // Wait until we land on a non-auth page (i.e. login is complete)
-  await page.waitForURL(
-    url => !url.includes('/login') && !url.includes('/auth') && !url.includes('/verify'),
-    { timeout: 300000 }
-  ).catch(() => {});
-
-  // Final check
-  const loggedIn = await page.$('[data-testid="user-menu"], a[href*="/logout"], [aria-label*="account"], [aria-label*="Account"]').catch(() => null);
-  if (!loggedIn) throw new Error('Login timed out or failed. Run with HEADLESS=false and complete the login manually.');
-
-  // Save session so we don't need to log in again next time
-  const cookies = await page.context().cookies();
-  fs.writeFileSync(cfg.sessionFile, JSON.stringify(cookies, null, 2));
-  console.log(`[${ts()}] ✓  Logged in. Session saved — next run will skip login.`);
-}
-
-// ─── Cookie consent ────────────────────────────────────────────────────────
-
-async function acceptCookies(page) {
-  try {
-    const btn = await page.waitForSelector(
-      'button:has-text("Accept"), button:has-text("Accept all"), button:has-text("Akkoord"), [data-testid="cookie-accept"]',
-      { timeout: 4000 }
-    );
-    if (btn) await btn.click();
-  } catch { /* no banner */ }
-}
-
-// ─── Ticket detection ──────────────────────────────────────────────────────
-
-const TICKET_SELECTORS = [
-  '[data-testid*="listing"]',
-  '[data-testid*="ticket"]',
-  'li[class*="Listing"]',
-  'li[class*="listing"]',
-  'article[class*="listing"]',
-  'article[class*="ticket"]',
-  '[class*="TicketListing"]',
-  '[class*="ticket-listing"]',
-];
-
-const BUY_BTN_SELECTORS = [
-  'button:has-text("Buy")',
-  'a:has-text("Buy")',
-  'button:has-text("Koop")',
-  'a:has-text("Koop")',
-  '[data-testid*="buy"]',
-  'button[class*="buy"]',
-  'a[class*="buy"]',
-  'button[class*="Buy"]',
-  'a[class*="Buy"]',
-];
-
-const PRICE_SELECTORS = [
-  '[data-testid*="price"]',
-  '[class*="Price"]',
-  '[class*="price"]',
-  'span[class*="amount"]',
-  'strong',
-];
-
-async function scrapeListings(page) {
-  for (const sel of TICKET_SELECTORS) {
-    const items = await page.$$(sel);
-    if (items.length > 0) return items;
-  }
-  return [];
-}
-
-async function extractPrice(element) {
-  for (const sel of PRICE_SELECTORS) {
-    try {
-      const text = await element.$eval(sel, el => el.textContent);
-      const match = text.match(/[\d]+[.,]?\d*/);
-      if (match) return parseFloat(match[0].replace(',', '.'));
-    } catch { /* try next */ }
-  }
-  try {
-    const text = await element.evaluate(el => el.innerText);
-    const m1 = text.match(/€\s*([\d]+[.,]?\d*)/);
-    if (m1) return parseFloat(m1[1].replace(',', '.'));
-    const m2 = text.match(/([\d]+[.,]\d{2})/);
-    if (m2) return parseFloat(m2[1].replace(',', '.'));
-  } catch { /* ignored */ }
-  return null;
-}
-
-async function findBuyButton(element) {
-  for (const sel of BUY_BTN_SELECTORS) {
-    try {
-      const btn = await element.$(sel);
-      if (btn) return btn;
-    } catch { /* try next */ }
-  }
-  try {
-    const tag  = await element.evaluate(el => el.tagName.toLowerCase());
-    const text = await element.evaluate(el => el.innerText.toLowerCase());
-    if ((tag === 'a' || tag === 'button') && (text.includes('buy') || text.includes('koop'))) {
-      return element;
+  function walk(obj) {
+    if (!obj || typeof obj !== 'object') return;
+    // Look for objects that look like ticket listings
+    if (obj.price != null && (obj.id || obj.publicId) &&
+        (obj.status === 'available' || obj.status === 'AVAILABLE' || obj.isAvailable)) {
+      listings.push(obj);
     }
-  } catch { /* ignored */ }
-  return null;
+    // Also catch edges pattern (GraphQL connections)
+    if (Array.isArray(obj.edges)) {
+      obj.edges.forEach(e => walk(e.node || e));
+    }
+    if (Array.isArray(obj)) {
+      obj.forEach(walk);
+    } else {
+      Object.values(obj).forEach(walk);
+    }
+  }
+
+  walk(data.props?.pageProps);
+  return listings;
 }
 
-async function findEligibleTicket(page, event) {
-  const listings = await scrapeListings(page);
-  if (listings.length === 0) return null;
-
-  for (const listing of listings) {
-    const price = await extractPrice(listing);
-    if (price === null) continue;
-    if (price > event.maxPrice) continue;
-
-    const btn = await findBuyButton(listing);
-    if (!btn) continue;
-
-    const disabled = await btn.evaluate(el => el.disabled || el.getAttribute('aria-disabled') === 'true');
-    if (disabled) continue;
-
-    return { listing, btn, price };
+function extractPrice(listing) {
+  if (listing.price == null) return null;
+  if (typeof listing.price === 'number') return listing.price / 100; // cents → euros
+  if (typeof listing.price === 'object') {
+    const raw = listing.price.amount ?? listing.price.totalPrice ?? listing.price.value;
+    if (raw == null) return null;
+    // If value looks like cents (> 200), convert; otherwise treat as euros
+    return raw > 200 ? raw / 100 : raw;
   }
   return null;
 }
 
-// ─── Purchase flow ─────────────────────────────────────────────────────────
+// ─── GraphQL ticket search (fallback) ──────────────────────────────────────
 
-async function buyTicket(page, event, { btn, price }) {
-  ok(event.label, `Ticket at €${price.toFixed(2)}! Buying...`);
-  await btn.click();
-
-  await Promise.race([
-    page.waitForURL(u => u.includes('checkout') || u.includes('purchase') || u.includes('order'), { timeout: 10000 }),
-    page.waitForSelector('[data-testid*="checkout"], [class*="checkout"], [class*="Checkout"]', { timeout: 10000 }),
-    page.waitForTimeout(5000),
-  ]).catch(() => {});
-
-  await selectQuantity(page, event);
-  await acceptTerms(page);
-
-  const confirmed = await clickConfirmButton(page, event.label);
-  if (!confirmed) {
-    warn(event.label, 'Could not find confirm/pay button — manual action may be required.');
-    return false;
-  }
-
-  await page.waitForTimeout(4000);
-  const finalUrl = page.url();
-  const success  = /success|confirm|order|thank/i.test(finalUrl);
-
-  if (success) ok(event.label, `Purchase complete! ${finalUrl}`);
-  else warn(event.label, `Outcome unclear — check your TicketSwap account. URL: ${finalUrl}`);
-
-  return success;
+// Try to extract event slug/ID from URL for GraphQL query
+function slugFromUrl(url) {
+  const u = new URL(url);
+  const parts = u.pathname.split('/').filter(Boolean);
+  return parts[parts.length - 1].split('?')[0];
 }
 
-async function selectQuantity(page, event) {
-  if (event.quantity === 1) return;
-  try {
-    const plus = await page.$('[data-testid*="increase"], button[aria-label*="increase"], button:has-text("+")');
-    if (plus) {
-      for (let i = 1; i < event.quantity; i++) {
-        await plus.click();
-        await page.waitForTimeout(300);
+const LISTINGS_QUERY = `
+  query GetListings($slug: String!) {
+    event(slug: $slug) {
+      id
+      title
+      listings(first: 20) {
+        edges {
+          node {
+            id
+            publicId
+            status
+            numberOfTickets
+            price {
+              amount
+              currency
+            }
+          }
+        }
       }
-      return;
     }
-    const input = await page.$('input[type="number"]');
-    if (input) await input.fill(String(event.quantity));
-  } catch {
-    warn(event.label, 'Could not set quantity — proceeding with default.');
   }
-}
+`;
 
-async function acceptTerms(page) {
+async function fetchListingsViaApi(event) {
   try {
-    const checkbox = await page.$('input[type="checkbox"]');
-    if (checkbox && !(await checkbox.isChecked())) await checkbox.click();
-  } catch { /* no checkbox */ }
-}
-
-async function clickConfirmButton(page, label) {
-  const candidates = [
-    'button:has-text("Confirm")', 'button:has-text("Pay")',
-    'button:has-text("Buy now")', 'button:has-text("Place order")',
-    'button:has-text("Complete")', 'button:has-text("Bevestig")',
-    'button:has-text("Betaal")', '[data-testid*="confirm"]',
-    '[data-testid*="pay"]', 'button[type="submit"]',
-  ];
-  for (const sel of candidates) {
-    try {
-      const btn = await page.$(sel);
-      if (!btn) continue;
-      if (await btn.evaluate(el => el.disabled)) continue;
-      await btn.click();
-      return true;
-    } catch { /* try next */ }
+    const slug = slugFromUrl(event.url);
+    const data = await graphql(LISTINGS_QUERY, { slug });
+    const edges = data?.data?.event?.listings?.edges || [];
+    return edges
+      .map(e => e.node)
+      .filter(n => n && (n.status === 'available' || n.status === 'AVAILABLE'));
+  } catch {
+    return [];
   }
-  return false;
 }
 
-// ─── Verification challenge handler ────────────────────────────────────────
+// ─── Purchase ──────────────────────────────────────────────────────────────
 
-async function waitForVerification(page, label) {
-  const body = await page.evaluate(() => document.body.innerText).catch(() => '');
-  if (!body.includes('Unable to verify')) return; // no challenge, all good
+const RESERVE_MUTATION = `
+  mutation ReserveListing($listingId: ID!, $amount: Int!) {
+    reserveListing(input: { listingId: $listingId, amount: $amount }) {
+      order {
+        id
+        status
+        confirmationUrl
+      }
+    }
+  }
+`;
 
-  console.log(`\n[${ts()}] [${label}] ⚠  Bot check detected!`);
-  console.log(`[${ts()}] [${label}] ⚠  Click the "Retry" button in the browser tab for [${label}].`);
-  console.log(`[${ts()}] [${label}] ⚠  Waiting up to 2 minutes for you to solve it...\n`);
-
-  await page.waitForFunction(
-    () => !document.body.innerText.includes('Unable to verify'),
-    { timeout: 120000, polling: 1000 }
-  ).catch(() => {});
+async function purchaseListing(listing, event, label) {
+  // Try GraphQL mutation first
+  try {
+    const result = await graphql(RESERVE_MUTATION, {
+      listingId: listing.id || listing.publicId,
+      amount:    event.quantity,
+    });
+    const order = result?.data?.reserveListing?.order;
+    if (order) {
+      ok(label, `Order created! ID: ${order.id}  Status: ${order.status}`);
+      if (order.confirmationUrl) ok(label, `Confirm at: ${order.confirmationUrl}`);
+      return true;
+    }
+    const errors = result?.errors?.map(e => e.message).join(', ');
+    warn(label, `Reservation failed: ${errors || 'unknown error'}`);
+    return false;
+  } catch (e) {
+    warn(label, `Purchase API error: ${e.message}`);
+    return false;
+  }
 }
 
-// ─── Per-event poller ──────────────────────────────────────────────────────
+// ─── Poller ────────────────────────────────────────────────────────────────
 
-async function pollEvent(context, event) {
-  const page = await context.newPage();
-
-  // Block heavy assets on this page to speed up reloads
-  await page.route('**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf,otf}', r => r.abort());
-
-  log(event.label, `Starting — ${event.url}`);
+async function pollEvent(event) {
+  log(event.label, `Watching: ${event.url}`);
   log(event.label, `Max price: €${event.maxPrice}  |  Qty: ${event.quantity}`);
-
-  await page.goto(event.url, { waitUntil: 'domcontentloaded', timeout: 20000 });
 
   let attempt = 0;
 
   while (true) {
     attempt++;
     try {
-      await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
-      await acceptCookies(page);
+      // Strategy 1: fetch page HTML and parse Next.js data
+      let eligible = [];
+      try {
+        const html = await fetchPage(event.url);
+        const nextData = parseNextData(html);
+        const allListings = extractListingsFromNextData(nextData);
+        eligible = allListings.filter(l => {
+          const price = extractPrice(l);
+          return price !== null && price <= event.maxPrice;
+        });
+      } catch { /* fallthrough to strategy 2 */ }
 
-      // If Cloudflare/TicketSwap shows a challenge, wait for the user to solve it
-      await waitForVerification(page, event.label);
+      // Strategy 2: GraphQL API
+      if (eligible.length === 0) {
+        const apiListings = await fetchListingsViaApi(event);
+        eligible = apiListings.filter(l => {
+          const price = extractPrice(l);
+          return price !== null && price <= event.maxPrice;
+        });
+      }
 
-      const ticket = await findEligibleTicket(page, event);
-
-      if (ticket) {
-        const bought = await buyTicket(page, event, ticket);
-        if (bought) {
-          await page.close();
-          return { event, success: true };
-        }
-        warn(event.label, 'Purchase failed — retrying next poll.');
+      if (eligible.length > 0) {
+        const listing = eligible[0];
+        const price   = extractPrice(listing);
+        ok(event.label, `Ticket found at €${price?.toFixed(2)}! Buying...`);
+        const bought = await purchaseListing(listing, event, event.label);
+        if (bought) return;
+        warn(event.label, 'Purchase failed — will retry.');
       } else {
-        process.stdout.write(`\r  [${event.label}] attempt ${attempt} — no eligible tickets yet...   `);
+        process.stdout.write(`\r  [${event.label}] attempt ${attempt} — watching...   `);
       }
     } catch (e) {
-      if (e.message.includes('closed')) {
-        warn(event.label, 'Browser was closed — stopping bot. Run npm start again.');
-        process.exit(1);
-      }
-      warn(event.label, `Poll error: ${e.message}`);
+      warn(event.label, `Error: ${e.message}`);
     }
 
     await sleep(cfg.pollInterval);
@@ -420,8 +266,6 @@ async function pollEvent(context, event) {
 
 // ─── Main ──────────────────────────────────────────────────────────────────
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
 async function main() {
   validateConfig();
   const events = loadEvents();
@@ -429,39 +273,15 @@ async function main() {
   console.log('\n╔══════════════════════════════════╗');
   console.log('║   TicketSwap Auto-Buyer Bot      ║');
   console.log('╚══════════════════════════════════╝');
-  console.log(`\n  Watching ${events.length} event(s). Press Ctrl+C to stop.\n`);
-  events.forEach(e => console.log(`  • [${e.label}] ${e.url}  (max €${e.maxPrice}, qty ${e.quantity})`));
+  console.log(`\n  No browser needed — using your session token directly.`);
+  console.log(`  Watching ${events.length} event(s). Press Ctrl+C to stop.\n`);
+  events.forEach(e => console.log(`  • [${e.label}] max €${e.maxPrice}, qty ${e.quantity}`));
   console.log();
 
-  // launchBrowser() returns the persistent context directly
-  const context = await launchBrowser();
+  process.on('SIGINT', () => { console.log('\nStopped.'); process.exit(0); });
 
-  process.on('SIGINT', async () => {
-    console.log('\nShutting down...');
-    await context.close();
-    process.exit(0);
-  });
-
-  try {
-    // Login once using a temporary page
-    const loginPage = await context.newPage();
-    const alreadyIn = await isLoggedIn(loginPage);
-    if (alreadyIn) {
-      console.log(`[${ts()}] ✓  Session still active — skipping login.`);
-    } else {
-      await login(loginPage);
-    }
-    await loginPage.close();
-
-    // Poll all events concurrently — each gets its own tab
-    await Promise.all(events.map(event => pollEvent(context, event)));
-
-  } catch (e) {
-    console.error(`[${ts()}] ✗  ${e.message}`);
-    if (cfg.headless) console.warn(`[${ts()}] ⚠  Tip: run with HEADLESS=false to debug.`);
-  } finally {
-    await context.close();
-  }
+  // Poll all events concurrently
+  await Promise.all(events.map(pollEvent));
 }
 
 main();
