@@ -11,7 +11,6 @@ const path = require('path');
 
 const cfg = {
   email:        process.env.TS_EMAIL,
-  password:     process.env.TS_PASSWORD,
   pollInterval: parseInt(process.env.TS_POLL_INTERVAL, 10) || 2000,
   headless:     process.env.HEADLESS !== 'false',
   sessionFile:  path.join(__dirname, '.session.json'),
@@ -56,10 +55,9 @@ function loadEvents() {
 }
 
 function validateConfig() {
-  const missing = ['email', 'password'].filter(k => !cfg[k]);
-  if (missing.length) {
-    console.error(`Missing required env vars: ${missing.map(k => `TS_${k.toUpperCase()}`).join(', ')}`);
-    console.error('Copy .env.example to .env and fill in your details.');
+  if (!cfg.email) {
+    console.error('Missing required env var: TS_EMAIL');
+    console.error('Run: echo "TS_EMAIL=your@email.com" > .env');
     process.exit(1);
   }
 }
