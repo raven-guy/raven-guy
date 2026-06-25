@@ -64,6 +64,12 @@ function validateConfig() {
 
 // ─── Browser ───────────────────────────────────────────────────────────────
 
+// Locations where Google Chrome is typically installed on macOS
+const MAC_CHROME_PATHS = [
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  '/Applications/Chromium.app/Contents/MacOS/Chromium',
+];
+
 async function launchBrowser() {
   const opts = {
     headless: cfg.headless,
@@ -71,18 +77,30 @@ async function launchBrowser() {
       '--disable-blink-features=AutomationControlled',
       '--no-sandbox',
       '--disable-setuid-sandbox',
+      '--disable-infobars',
+      '--disable-dev-shm-usage',
     ],
   };
-  if (fs.existsSync('/opt/pw-browsers/chromium')) {
+
+  // Prefer the user's real Chrome — it has a genuine fingerprint that passes bot detection
+  const realChrome = MAC_CHROME_PATHS.find(p => fs.existsSync(p));
+  if (realChrome) {
+    opts.executablePath = realChrome;
+    console.log(`Using real Chrome: ${realChrome}`);
+  } else if (fs.existsSync('/opt/pw-browsers/chromium')) {
     opts.executablePath = '/opt/pw-browsers/chromium';
+  } else {
+    // Let Playwright find the browser via channel
+    opts.channel = 'chrome';
   }
+
   return chromium.launch(opts);
 }
 
 async function buildContext(browser) {
   const context = await browser.newContext({
     viewport: { width: 1280, height: 800 },
-    userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     locale: 'en-US',
     timezoneId: 'Europe/Amsterdam',
   });
@@ -107,6 +125,11 @@ async function buildContext(browser) {
 async function isLoggedIn(page) {
   try {
     await page.goto('https://www.ticketswap.com', { waitUntil: 'domcontentloaded', timeout: 15000 });
+
+    // If TicketSwap shows a bot-detection page, we are definitely not logged in
+    const bodyText = await page.evaluate(() => document.body.innerText).catch(() => '');
+    if (bodyText.includes('Unable to verify') || bodyText.includes('Retry')) return false;
+
     const loginBtn = await page.$('a[href*="/login"], button:has-text("Log in"), a:has-text("Log in")');
     return loginBtn === null;
   } catch {
